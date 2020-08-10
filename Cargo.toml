@@ -1,0 +1,16 @@
+[package]
+name = "rocks-tables"
+version = "0.1.0"
+authors = ["Dany Laporte <dany_laporte@hotmail.com>"]
+edition = "2018"
+
+[features]
+default = []
+
+[dependencies]
+aes-gcm = "0.6"
+bincode = "1.3"
+chrono = { version = "0.4", optional = true, features = ["serde"] }
+rocksdb = { version = "0.14", default-features = false, features = ["zstd"] }
+serde = "1.0"
+uuid = { version = "0.8", optional = true, features = ["serde"] }
