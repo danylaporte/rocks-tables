@@ -1,6 +1,7 @@
 use crate::{AdaptToDb, Aged, Db, Result, UpdateFrom};
 use std::{
     collections::hash_map::{HashMap, RandomState},
+    fmt::Debug,
     hash::{BuildHasher, Hash},
 };
 
@@ -14,7 +15,7 @@ pub struct LruTable<'a, K, V, S = RandomState> {
 
 impl<'a, K, V> LruTable<'a, K, V, RandomState>
 where
-    K: for<'b> AdaptToDb<'b> + Eq + Hash,
+    K: for<'b> AdaptToDb<'b> + Debug + Eq + Hash,
     V: for<'b> AdaptToDb<'b>,
 {
     /// Creates a LruCachedTable.
@@ -25,7 +26,7 @@ where
 
 impl<'a, K, V, S> LruTable<'a, K, V, S>
 where
-    K: for<'b> AdaptToDb<'b> + Eq + Hash,
+    K: for<'b> AdaptToDb<'b> + Debug + Eq + Hash,
     V: for<'b> AdaptToDb<'b>,
     S: BuildHasher,
 {

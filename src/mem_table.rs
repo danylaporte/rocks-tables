@@ -3,6 +3,7 @@ use crate::UpdateFrom;
 use std::{
     borrow::Borrow,
     collections::hash_map::{HashMap, Iter, RandomState},
+    fmt::Debug,
     hash::{BuildHasher, Hash},
 };
 
@@ -14,7 +15,7 @@ pub struct MemTable<'a, K, V, S = RandomState> {
 
 impl<'a, K, V> MemTable<'a, K, V, RandomState>
 where
-    K: for<'b> AdaptToDb<'b> + Eq + Hash,
+    K: for<'b> AdaptToDb<'b> + Debug + Eq + Hash,
     V: for<'b> AdaptToDb<'b>,
 {
     pub fn new(db: Db<'a, K, V>) -> Result<Self> {
@@ -24,7 +25,7 @@ where
 
 impl<'a, K, V, S> MemTable<'a, K, V, S>
 where
-    K: for<'b> AdaptToDb<'b> + Eq + Hash,
+    K: for<'b> AdaptToDb<'b> + Debug + Eq + Hash,
     V: for<'b> AdaptToDb<'b>,
     S: BuildHasher,
 {

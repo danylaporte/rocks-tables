@@ -2,6 +2,7 @@ use super::{AdaptToDb, Aged, Db, IteratorMode, MinValue, Result};
 use rocksdb::Direction;
 use std::{
     collections::{hash_map::RandomState, HashMap},
+    fmt::Debug,
     hash::{BuildHasher, Hash},
 };
 
@@ -14,8 +15,8 @@ pub struct SectionLruTable<'a, S, K, V, H = RandomState> {
 
 impl<'a, S, K, V> SectionLruTable<'a, S, K, V, RandomState>
 where
-    S: for<'b> AdaptToDb<'b> + Clone + Eq + Hash,
-    K: for<'b> AdaptToDb<'b> + Eq + Hash + MinValue,
+    S: for<'b> AdaptToDb<'b> + Clone + Debug + Eq + Hash,
+    K: for<'b> AdaptToDb<'b> + Debug + Eq + Hash + MinValue,
     V: for<'b> AdaptToDb<'b>,
 {
     pub fn with_capacity(db: Db<'a, (S, K), V>, capacity: usize) -> Self {
@@ -25,8 +26,8 @@ where
 
 impl<'a, S, K, V, H> SectionLruTable<'a, S, K, V, H>
 where
-    S: for<'b> AdaptToDb<'b> + Clone + Eq + Hash,
-    K: for<'b> AdaptToDb<'b> + Eq + Hash + MinValue,
+    S: for<'b> AdaptToDb<'b> + Clone + Debug + Eq + Hash,
+    K: for<'b> AdaptToDb<'b> + Debug + Eq + Hash + MinValue,
     V: for<'b> AdaptToDb<'b>,
     H: BuildHasher + Default,
 {
@@ -117,9 +118,9 @@ where
 
 fn load_map<K, V, S, H>(section: S, db: &Db<(S, K), V>) -> Result<HashMap<K, V, H>>
 where
-    K: for<'a> AdaptToDb<'a> + Eq + Hash + MinValue,
+    K: for<'a> AdaptToDb<'a> + Debug + Eq + Hash + MinValue,
     V: for<'a> AdaptToDb<'a>,
-    S: for<'a> AdaptToDb<'a> + Clone + PartialEq,
+    S: for<'a> AdaptToDb<'a> + Clone + Debug + PartialEq,
     H: BuildHasher + Default,
 {
     let key = (section.clone(), K::min_value());

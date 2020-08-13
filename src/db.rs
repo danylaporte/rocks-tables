@@ -7,20 +7,42 @@ use bincode::{
     config::{BigEndian, WithOtherEndian},
     Options as _,
 };
+use fmt::Display;
 pub use rocksdb::Direction;
 use rocksdb::{DBCompressionType, DBRawIterator, Options};
-use std::{marker::PhantomData, path::Path};
+use std::{
+    fmt::{self, Debug},
+    marker::PhantomData,
+    path::Path,
+    sync::Arc,
+};
+use tracing::{field, trace_span, Span};
 
 pub struct Db<'a, K, V> {
     _k: PhantomData<K>,
     _v: PhantomData<V>,
     bin_opts: BinOpts,
     db: rocksdb::DB,
+    db_name: String,
     encrypt: Option<&'a Aes256Gcm>,
 }
 
 impl<K, V> Db<'static, K, V> {
-    pub fn new<P: AsRef<Path>>(path: P) -> Result<Self> {
+    pub fn open<P: AsRef<Path>>(path: P) -> Result<Self> {
+        let db_name = path
+            .as_ref()
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("")
+            .to_string();
+
+        let span = trace_span!(
+            "db::open",
+            db.name = db_name.as_str(),
+            db.system = "rocksdb",
+        );
+        let _ = span.enter();
+
         let mut o = Options::default();
         o.create_if_missing(true);
         o.set_compression_type(DBCompressionType::Zstd);
@@ -29,7 +51,8 @@ impl<K, V> Db<'static, K, V> {
             _k: PhantomData,
             _v: PhantomData,
             bin_opts: bin_opts(),
-            db: rocksdb::DB::open(&o, path)?,
+            db: rocksdb::DB::open(&o, path).map_err(span_err)?,
+            db_name,
             encrypt: None,
         })
     }
@@ -37,22 +60,42 @@ impl<K, V> Db<'static, K, V> {
 
 impl<'a, K, V> Db<'a, K, V>
 where
-    for<'b> K: AdaptToDb<'b>,
+    for<'b> K: AdaptToDb<'b> + Debug,
     for<'b> V: AdaptToDb<'b>,
 {
-    pub fn with_encrypt<P: AsRef<Path>>(path: P, aes_gcm: &'a Aes256Gcm) -> Result<Self> {
-        let mut db = Db::new(path)?;
+    pub fn open_encrypted<P: AsRef<Path>>(path: P, aes_gcm: &'a Aes256Gcm) -> Result<Self> {
+        let mut db = Db::open(path)?;
         db.encrypt = Some(aes_gcm);
         Ok(db)
     }
 
     pub fn contains_key(&self, key: &K) -> Result<bool> {
-        Ok(self.get_raw(key)?.is_some())
+        let span = trace_span!(
+            "db::contains_key",
+            db.name = self.db_name.as_str(),
+            db.statement = format!("{:?}", key).as_str(),
+            db.system = "rocksdb",
+            status = "ok",
+            status.detail = field::Empty,
+        );
+        let _ = span.enter();
+
+        Ok(self.get_raw(key).map_err(span_err)?.is_some())
     }
 
     pub fn delete(&self, key: &K) -> Result<()> {
-        let key = self.bin_opts.serialize(&key.to_db())?;
-        self.db.delete(&key)?;
+        let span = trace_span!(
+            "db::delete",
+            db.name = self.db_name.as_str(),
+            db.statement = format!("{:?}", key).as_str(),
+            db.system = "rocksdb",
+            status = "ok",
+            status.detail = field::Empty,
+        );
+        let _ = span.enter();
+
+        let key = self.bin_opts.serialize(&key.to_db()).map_err(span_err)?;
+        self.db.delete(&key).map_err(span_err)?;
         Ok(())
     }
 
@@ -64,9 +107,19 @@ where
     }
 
     fn get_raw(&self, key: &K) -> Result<Option<Vec<u8>>> {
-        let key = self.bin_opts.serialize(&key.to_db())?;
+        let span = trace_span!(
+            "db::get",
+            db.name = self.db_name.as_str(),
+            db.statement = format!("{:?}", key).as_str(),
+            db.system = "rocksdb",
+            status = "ok",
+            status.detail = field::Empty,
+        );
+        let _ = span.enter();
 
-        let value = match self.db.get(&key)? {
+        let key = self.bin_opts.serialize(&key.to_db()).map_err(span_err)?;
+
+        let value = match self.db.get(&key).map_err(span_err)? {
             Some(value) => value,
             None => return Ok(None),
         };
@@ -75,19 +128,29 @@ where
             Some(cipher) => {
                 let mut fallback = [0u8; 12];
                 let nonce = prepare_nonce(&key, &mut fallback);
-                cipher.decrypt(nonce, &value[..])?
+                cipher.decrypt(nonce, &value[..]).map_err(span_err)?
             }
             None => value,
         }))
     }
 
-    pub fn iter<'b>(&'b self, mode: IteratorMode<K>) -> Result<Iter<'b, K, V>> {
+    pub fn iter(&self, mode: IteratorMode<K>) -> Result<Iter<K, V>> {
+        let span = Arc::new(trace_span!(
+            "db::iter",
+            db.name = self.db_name.as_str(),
+            db.statement = format!("mode = {:?}", mode).as_str(),
+            db.system = "rocksdb",
+            status = "ok",
+            status.detail = field::Empty,
+        ));
+        let _ = span.enter();
+
         let bin_opts = &self.bin_opts;
         let mut iter = self.db.raw_iterator();
 
         let dir = match mode {
             IteratorMode::From(v, dir) => {
-                let key = bin_opts.serialize(&v.to_db())?;
+                let key = bin_opts.serialize(&v.to_db()).map_err(span_err)?;
 
                 match dir {
                     Direction::Forward => iter.seek(&key),
@@ -118,19 +181,29 @@ where
     }
 
     pub fn put(&self, key: &K, value: &V) -> Result<()> {
+        let span = trace_span!(
+            "db::put",
+            db.name = self.db_name.as_str(),
+            db.statement = format!("{:?}", key).as_str(),
+            db.system = "rocksdb",
+            status = "ok",
+            status.detail = field::Empty,
+        );
+        let _ = span.enter();
+
         // serializing keys in big endian to preserve sorting order when iterating the db.
-        let key = self.bin_opts.serialize(&key.to_db())?;
-        let val = self.bin_opts.serialize(&value.to_db())?;
+        let key = self.bin_opts.serialize(&key.to_db()).map_err(span_err)?;
+        let val = self.bin_opts.serialize(&value.to_db()).map_err(span_err)?;
 
         match &self.encrypt {
             Some(cypher) => {
                 let mut fallback = [0u8; 12];
                 let nonce = prepare_nonce(&key, &mut fallback);
-                let encrypted = cypher.encrypt(nonce, &val[..])?;
+                let encrypted = cypher.encrypt(nonce, &val[..]).map_err(span_err)?;
 
-                Ok(self.db.put(&key, encrypted)?)
+                Ok(self.db.put(&key, encrypted).map_err(span_err)?)
             }
-            None => Ok(self.db.put(&key, &val)?),
+            None => Ok(self.db.put(&key, &val).map_err(span_err)?),
         }
     }
 }
@@ -220,6 +293,28 @@ pub enum IteratorMode<K> {
     Start,
 }
 
+impl<K> Debug for IteratorMode<K>
+where
+    K: Debug,
+{
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("IteratorMode::")?;
+        match self {
+            Self::End => f.write_str("End"),
+            Self::From(key, dir) => {
+                f.write_str("From(")?;
+                key.fmt(f)?;
+                f.write_str(",")?;
+                f.write_str(match dir {
+                    Direction::Forward => "Forward)",
+                    Direction::Reverse => "Reverse)",
+                })
+            }
+            Self::Start => f.write_str("Start"),
+        }
+    }
+}
+
 pub struct Iter<'a, K, V> {
     _k: PhantomData<K>,
     _v: PhantomData<V>,
@@ -277,4 +372,11 @@ fn prepare_nonce<'a>(
         fallback.copy_from_slice(&key);
         GenericArray::from_slice(&*fallback)
     }
+}
+
+fn span_err<E: Display>(e: E) -> E {
+    Span::current()
+        .record("status", &"Internal")
+        .record("status.detail", &e.to_string().as_str());
+    e
 }
