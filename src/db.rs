@@ -16,7 +16,7 @@ use std::{
     path::Path,
     sync::Arc,
 };
-use tracing::{field, trace_span, Span};
+use tracing::{error, trace_span, Span};
 
 pub struct Db<'a, K, V> {
     _k: PhantomData<K>,
@@ -37,7 +37,7 @@ impl<K, V> Db<'static, K, V> {
             .to_string();
 
         let span = trace_span!(
-            "db::open",
+            "Db::open",
             db.name = db_name.as_str(),
             db.system = "rocksdb",
         );
@@ -71,12 +71,11 @@ where
 
     pub fn contains_key(&self, key: &K) -> Result<bool> {
         let span = trace_span!(
-            "db::contains_key",
+            "Db::contains_key",
             db.name = self.db_name.as_str(),
             db.statement = format!("{:?}", key).as_str(),
             db.system = "rocksdb",
-            status = "ok",
-            status.detail = field::Empty,
+            http.status_code = "200",
         );
         let _ = span.enter();
 
@@ -85,12 +84,11 @@ where
 
     pub fn delete(&self, key: &K) -> Result<()> {
         let span = trace_span!(
-            "db::delete",
+            "Db::delete",
             db.name = self.db_name.as_str(),
             db.statement = format!("{:?}", key).as_str(),
             db.system = "rocksdb",
-            status = "ok",
-            status.detail = field::Empty,
+            http.status_code = "200",
         );
         let _ = span.enter();
 
@@ -100,23 +98,24 @@ where
     }
 
     pub fn get(&self, key: &K) -> Result<Option<V>> {
+        let span = trace_span!(
+            "Db::get",
+            db.name = self.db_name.as_str(),
+            db.statement = format!("{:?}", key).as_str(),
+            db.system = "rocksdb",
+            http.status_code = "200",
+        );
+        let _ = span.enter();
+
         Ok(match self.get_raw(key)? {
-            Some(bytes) => Some(V::from_db(self.bin_opts.deserialize(&bytes)?)),
+            Some(bytes) => Some(V::from_db(
+                self.bin_opts.deserialize(&bytes).map_err(span_err)?,
+            )),
             None => None,
         })
     }
 
     fn get_raw(&self, key: &K) -> Result<Option<Vec<u8>>> {
-        let span = trace_span!(
-            "db::get",
-            db.name = self.db_name.as_str(),
-            db.statement = format!("{:?}", key).as_str(),
-            db.system = "rocksdb",
-            status = "ok",
-            status.detail = field::Empty,
-        );
-        let _ = span.enter();
-
         let key = self.bin_opts.serialize(&key.to_db()).map_err(span_err)?;
 
         let value = match self.db.get(&key).map_err(span_err)? {
@@ -136,12 +135,11 @@ where
 
     pub fn iter(&self, mode: IteratorMode<K>) -> Result<Iter<K, V>> {
         let span = Arc::new(trace_span!(
-            "db::iter",
+            "Db::iter",
             db.name = self.db_name.as_str(),
             db.statement = format!("mode = {:?}", mode).as_str(),
             db.system = "rocksdb",
-            status = "ok",
-            status.detail = field::Empty,
+            http.status_code = "200",
         ));
         let _ = span.enter();
 
@@ -174,6 +172,7 @@ where
             _v: PhantomData,
             bin_opts,
             dir,
+            db_name: &self.db_name,
             encrypt: self.encrypt,
             iter,
             must_call_next: false,
@@ -182,12 +181,11 @@ where
 
     pub fn put(&self, key: &K, value: &V) -> Result<()> {
         let span = trace_span!(
-            "db::put",
+            "Db::put",
             db.name = self.db_name.as_str(),
             db.statement = format!("{:?}", key).as_str(),
             db.system = "rocksdb",
-            status = "ok",
-            status.detail = field::Empty,
+            http.status_code = "200",
         );
         let _ = span.enter();
 
@@ -219,6 +217,7 @@ pub struct DbKeyValue<'a, K, V> {
     _k: PhantomData<K>,
     _v: PhantomData<V>,
     bin_opts: &'a BinOpts,
+    db_name: &'a str,
     encrypt: Option<&'a Aes256Gcm>,
     iter: &'a DBRawIterator<'a>,
 }
@@ -228,15 +227,21 @@ where
     K: for<'b> AdaptToDb<'b>,
 {
     pub fn get_key(&self) -> Result<K> {
-        Ok(K::from_db(self.bin_opts.deserialize(
-            self.iter.key().ok_or_else(|| Error::NoKey)?,
-        )?))
+        Ok(K::from_db(
+            self.bin_opts.deserialize(
+                self.iter
+                    .key()
+                    .ok_or_else(|| Error::NoKey)
+                    .map_err(|e| log_err(self.db_name, "get_key", e))?,
+            )?,
+        ))
     }
 
     pub fn into_db_value(self) -> DbValue<'a, V> {
         DbValue {
             _v: PhantomData,
             bin_opts: self.bin_opts,
+            db_name: self.db_name,
             encrypt: self.encrypt,
             iter: self.iter,
         }
@@ -244,10 +249,12 @@ where
 
     pub fn into_key_and_db_value(self) -> Result<(K, DbValue<'a, V>)> {
         Ok((
-            self.get_key()?,
+            self.get_key()
+                .map_err(|e| log_err(self.db_name, "into_key_and_db_value", e))?,
             DbValue {
                 _v: PhantomData,
                 bin_opts: self.bin_opts,
+                db_name: self.db_name,
                 encrypt: self.encrypt,
                 iter: self.iter,
             },
@@ -258,6 +265,7 @@ where
 pub struct DbValue<'a, V> {
     _v: PhantomData<V>,
     bin_opts: &'a BinOpts,
+    db_name: &'a str,
     encrypt: Option<&'a Aes256Gcm>,
     iter: &'a DBRawIterator<'a>,
 }
@@ -267,23 +275,39 @@ where
     V: AdaptToDb<'a>,
 {
     pub fn into_value(self) -> Result<V> {
-        let value = self.iter.value().ok_or_else(|| Error::NoValue)?;
+        let value = self
+            .iter
+            .value()
+            .ok_or_else(|| Error::NoValue)
+            .map_err(|e| log_err(self.db_name, "into_value", e))?;
+
         let decrypted;
 
         let value = match self.encrypt {
             None => value,
             Some(cipher) => {
-                let key = self.iter.key().ok_or_else(|| Error::NoKey)?;
+                let key = self
+                    .iter
+                    .key()
+                    .ok_or_else(|| Error::NoKey)
+                    .map_err(|e| log_err(self.db_name, "into_value", e))?;
+
                 let mut fallback = [0u8; 12];
                 let nonce = prepare_nonce(&key, &mut fallback);
 
-                decrypted = cipher.decrypt(nonce, &value[..])?;
+                decrypted = cipher
+                    .decrypt(nonce, &value[..])
+                    .map_err(|e| log_err(self.db_name, "into_value", e))?;
 
                 &decrypted
             }
         };
 
-        Ok(V::from_db(self.bin_opts.deserialize(value)?))
+        Ok(V::from_db(
+            self.bin_opts
+                .deserialize(value)
+                .map_err(|e| log_err(self.db_name, "into_value", e))?,
+        ))
     }
 }
 
@@ -319,6 +343,7 @@ pub struct Iter<'a, K, V> {
     _k: PhantomData<K>,
     _v: PhantomData<V>,
     bin_opts: &'a BinOpts,
+    db_name: &'a str,
     dir: Direction,
     encrypt: Option<&'a Aes256Gcm>,
     iter: DBRawIterator<'a>,
@@ -331,6 +356,7 @@ impl<'a, K, V> Iter<'a, K, V> {
             _k: PhantomData,
             _v: PhantomData,
             bin_opts: self.bin_opts,
+            db_name: self.db_name,
             encrypt: self.encrypt,
             iter: &self.iter,
         }
@@ -343,7 +369,9 @@ impl<'a, K, V> Iter<'a, K, V> {
                 Direction::Reverse => self.iter.prev(),
             }
 
-            self.iter.status()?;
+            self.iter
+                .status()
+                .map_err(|e| log_err(self.db_name, "next", e))?;
         }
 
         self.must_call_next = true;
@@ -354,6 +382,11 @@ impl<'a, K, V> Iter<'a, K, V> {
             None
         })
     }
+}
+
+fn log_err<E: Display>(db_name: &str, db_operation: &str, e: E) -> E {
+    error!({ db.name = db_name, db.operation = db_operation, db.system = "rocksdb" }, "{}", e);
+    e
 }
 
 fn prepare_nonce<'a>(
@@ -375,8 +408,7 @@ fn prepare_nonce<'a>(
 }
 
 fn span_err<E: Display>(e: E) -> E {
-    Span::current()
-        .record("status", &"Internal")
-        .record("status.detail", &e.to_string().as_str());
+    Span::current().record("http.status_code", &"500");
+    error!("{}", e);
     e
 }
