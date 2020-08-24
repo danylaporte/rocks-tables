@@ -2,6 +2,7 @@ use std::{error, fmt};
 
 #[derive(Debug)]
 pub enum Error {
+    #[cfg(feature = "aes-gcm")]
     AesGcm(aes_gcm::Error),
     NoKey,
     NoValue,
@@ -12,6 +13,7 @@ pub enum Error {
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter) -> Result<(), fmt::Error> {
         match self {
+            #[cfg(feature = "aes-gcm")]
             Self::AesGcm(e) => {
                 f.write_str("Encryption error: ")?;
                 e.fmt(f)
@@ -32,6 +34,7 @@ impl fmt::Display for Error {
 
 impl error::Error for Error {}
 
+#[cfg(feature = "aes-gcm")]
 impl From<aes_gcm::Error> for Error {
     fn from(e: aes_gcm::Error) -> Self {
         Self::AesGcm(e)

@@ -1,4 +1,5 @@
-use crate::{AdaptToDb, Aged, Db, Result, UpdateFrom};
+use crate::{Aged, Db, Result, UpdateFrom};
+use serde::{Deserialize, Serialize};
 use std::{
     collections::hash_map::{HashMap, RandomState},
     fmt::Debug,
@@ -7,31 +8,31 @@ use std::{
 
 /// A table that keep in memory only a small percent of the real table.
 /// Last recent used items are discard from memory when the capacity is reached.
-pub struct LruTable<'a, K, V, S = RandomState> {
+pub struct LruTable<K, V, S = RandomState> {
     age: u64,
-    db: Db<'a, K, V>,
+    db: Db<K>,
     map: HashMap<K, Aged<V>, S>,
 }
 
-impl<'a, K, V> LruTable<'a, K, V, RandomState>
+impl<K, V> LruTable<K, V, RandomState>
 where
-    K: for<'b> AdaptToDb<'b> + Debug + Eq + Hash,
-    V: for<'b> AdaptToDb<'b>,
+    K: Debug + for<'de> Deserialize<'de> + Eq + Hash + Serialize,
+    V: for<'de> Deserialize<'de> + Serialize,
 {
     /// Creates a LruCachedTable.
-    pub fn with_capacity(db: Db<'a, K, V>, capacity: usize) -> Self {
+    pub fn with_capacity(db: Db<K>, capacity: usize) -> Self {
         Self::with_capacity_and_hasher(db, capacity, Default::default())
     }
 }
 
-impl<'a, K, V, S> LruTable<'a, K, V, S>
+impl<K, V, S> LruTable<K, V, S>
 where
-    K: for<'b> AdaptToDb<'b> + Debug + Eq + Hash,
-    V: for<'b> AdaptToDb<'b>,
+    K: Debug + for<'de> Deserialize<'de> + Eq + Hash + Serialize,
+    V: for<'de> Deserialize<'de> + Serialize,
     S: BuildHasher,
 {
     /// Creates a LruCachedTable with a hasher.
-    pub fn with_capacity_and_hasher(db: Db<'a, K, V>, capacity: usize, hash_builder: S) -> Self {
+    pub fn with_capacity_and_hasher(db: Db<K>, capacity: usize, hash_builder: S) -> Self {
         assert!(capacity > 0);
 
         Self {
@@ -78,6 +79,7 @@ where
 
             match self.db.get(key)? {
                 Some(value) => {
+                    let value = value.to_inner()?;
                     self.map.insert(key.clone(), Aged { age: 0, value });
                 }
                 None => return Ok(None),
@@ -100,21 +102,16 @@ where
         self.db.put(key, &value)?;
         self.age += 1;
 
+        let age = self.age;
+
         match self.map.get_mut(key) {
             Some(aged) => {
-                aged.age = self.age;
+                aged.age = age;
                 aged.value = value;
             }
             None => {
                 self.ensure_capacity();
-
-                self.map.insert(
-                    key.clone(),
-                    Aged {
-                        age: self.age,
-                        value: value,
-                    },
-                );
+                self.map.insert(key.clone(), Aged { age, value });
             }
         }
 
@@ -136,9 +133,16 @@ where
             }
             None => {
                 must_ensure_capacity = true;
+
+                let mut old = None;
+
+                if let Some(item) = self.db.get(key)? {
+                    old = Some(item.to_inner()?);
+                }
+
                 Aged {
                     age: 0,
-                    value: update.update_from(self.db.get(key)?),
+                    value: update.update_from(old),
                 }
             }
         };

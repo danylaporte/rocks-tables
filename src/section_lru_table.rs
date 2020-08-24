@@ -1,5 +1,5 @@
-use super::{AdaptToDb, Aged, Db, IteratorMode, MinValue, Result};
-use rocksdb::Direction;
+use super::{Aged, Db, Direction, IteratorMode, MinValue, Result};
+use serde::{Deserialize, Serialize};
 use std::{
     collections::{hash_map::RandomState, HashMap},
     fmt::Debug,
@@ -7,31 +7,31 @@ use std::{
 };
 
 /// A tables that keep section of records in memory and remove the last recently used section.
-pub struct SectionLruTable<'a, S, K, V, H = RandomState> {
+pub struct SectionLruTable<S, K, V, H = RandomState> {
     age: u64,
-    db: Db<'a, (S, K), V>,
+    db: Db<(S, K)>,
     map: HashMap<S, Aged<HashMap<K, V, H>>, H>,
 }
 
-impl<'a, S, K, V> SectionLruTable<'a, S, K, V, RandomState>
+impl<S, K, V> SectionLruTable<S, K, V, RandomState>
 where
-    S: for<'b> AdaptToDb<'b> + Clone + Debug + Eq + Hash,
-    K: for<'b> AdaptToDb<'b> + Debug + Eq + Hash + MinValue,
-    V: for<'b> AdaptToDb<'b>,
+    S: for<'de> Deserialize<'de> + Clone + Debug + Eq + Hash + Serialize,
+    K: for<'de> Deserialize<'de> + Debug + Eq + Hash + MinValue + Serialize,
+    V: for<'de> Deserialize<'de> + Serialize,
 {
-    pub fn with_capacity(db: Db<'a, (S, K), V>, capacity: usize) -> Self {
+    pub fn with_capacity(db: Db<(S, K)>, capacity: usize) -> Self {
         Self::with_capacity_and_hasher(db, capacity, Default::default())
     }
 }
 
-impl<'a, S, K, V, H> SectionLruTable<'a, S, K, V, H>
+impl<S, K, V, H> SectionLruTable<S, K, V, H>
 where
-    S: for<'b> AdaptToDb<'b> + Clone + Debug + Eq + Hash,
-    K: for<'b> AdaptToDb<'b> + Debug + Eq + Hash + MinValue,
-    V: for<'b> AdaptToDb<'b>,
+    S: for<'de> Deserialize<'de> + Clone + Debug + Eq + Hash + Serialize,
+    K: for<'de> Deserialize<'de> + Debug + Eq + Hash + MinValue + Serialize,
+    V: for<'de> Deserialize<'de> + Serialize,
     H: BuildHasher + Default,
 {
-    pub fn with_capacity_and_hasher(db: Db<'a, (S, K), V>, capacity: usize, hasher: H) -> Self {
+    pub fn with_capacity_and_hasher(db: Db<(S, K)>, capacity: usize, hasher: H) -> Self {
         assert!(capacity > 0);
 
         Self {
@@ -116,11 +116,11 @@ where
     }
 }
 
-fn load_map<K, V, S, H>(section: S, db: &Db<(S, K), V>) -> Result<HashMap<K, V, H>>
+fn load_map<K, V, S, H>(section: S, db: &Db<(S, K)>) -> Result<HashMap<K, V, H>>
 where
-    K: for<'a> AdaptToDb<'a> + Debug + Eq + Hash + MinValue,
-    V: for<'a> AdaptToDb<'a>,
-    S: for<'a> AdaptToDb<'a> + Clone + Debug + PartialEq,
+    S: for<'de> Deserialize<'de> + Clone + Debug + PartialEq + Serialize,
+    K: for<'de> Deserialize<'de> + Debug + Eq + Hash + MinValue + Serialize,
+    V: for<'de> Deserialize<'de> + Serialize,
     H: BuildHasher + Default,
 {
     let key = (section.clone(), K::min_value());
@@ -129,14 +129,13 @@ where
     let mut map = HashMap::with_hasher(Default::default());
 
     while let Some(item) = iter.next()? {
-        let ((s, key), db_value) = item.into_key_and_db_value()?;
+        let (s, key) = item.key()?;
 
         if s != section {
             break;
         }
 
-        let value = db_value.into_value()?;
-        map.insert(key, value);
+        map.insert(key, item.value()?);
     }
 
     Ok(map)

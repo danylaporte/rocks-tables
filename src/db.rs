@@ -1,33 +1,25 @@
-use crate::{AdaptToDb, Error, Result};
-use aes_gcm::{
-    aead::{generic_array::GenericArray, Aead},
-    Aes256Gcm,
-};
-use bincode::{
-    config::{BigEndian, WithOtherEndian},
-    Options as _,
-};
+use crate::{Error, Result};
 use fmt::Display;
-pub use rocksdb::Direction;
-use rocksdb::{DBCompressionType, DBRawIterator, Options};
+use rocksdb::{DBCompressionType, DBPinnableSlice, DBRawIterator, Options};
+use serde::{Deserialize, Serialize};
 use std::{
     fmt::{self, Debug},
     marker::PhantomData,
     path::Path,
     sync::Arc,
 };
-use tracing::{error, trace_span, Span};
+use tracing::{error, trace_span};
 
-pub struct Db<'a, K, V> {
+pub struct Db<K> {
     _k: PhantomData<K>,
-    _v: PhantomData<V>,
-    bin_opts: BinOpts,
     db: rocksdb::DB,
     db_name: String,
-    encrypt: Option<&'a Aes256Gcm>,
 }
 
-impl<K, V> Db<'static, K, V> {
+impl<K> Db<K>
+where
+    K: Debug + for<'de> Deserialize<'de> + Serialize,
+{
     pub fn open<P: AsRef<Path>>(path: P) -> Result<Self> {
         let db_name = path
             .as_ref()
@@ -36,119 +28,86 @@ impl<K, V> Db<'static, K, V> {
             .unwrap_or("")
             .to_string();
 
-        let span = trace_span!(
-            "Db::open",
-            db.name = db_name.as_str(),
-            db.system = "rocksdb",
-        );
-        let _ = span.enter();
-
-        let mut o = Options::default();
-        o.create_if_missing(true);
-        o.set_compression_type(DBCompressionType::Zstd);
+        let _ = trace_span!("open", db.name = db_name.as_str(), db.system = "rocksdb").enter();
+        let mut opts = Options::default();
+        opts.create_if_missing(true);
+        opts.set_compression_type(DBCompressionType::Zstd);
 
         Ok(Db {
             _k: PhantomData,
-            _v: PhantomData,
-            bin_opts: bin_opts(),
-            db: rocksdb::DB::open(&o, path).map_err(span_err)?,
+            db: rocksdb::DB::open(&opts, path).map_err(|e| map_log_err(e, &db_name))?,
             db_name,
-            encrypt: None,
         })
-    }
-}
-
-impl<'a, K, V> Db<'a, K, V>
-where
-    for<'b> K: AdaptToDb<'b> + Debug,
-    for<'b> V: AdaptToDb<'b>,
-{
-    pub fn open_encrypted<P: AsRef<Path>>(path: P, aes_gcm: &'a Aes256Gcm) -> Result<Self> {
-        let mut db = Db::open(path)?;
-        db.encrypt = Some(aes_gcm);
-        Ok(db)
     }
 
     pub fn contains_key(&self, key: &K) -> Result<bool> {
-        let span = trace_span!(
-            "Db::contains_key",
+        let _ = trace_span!(
+            "contains_key",
             db.name = self.db_name.as_str(),
-            db.statement = format!("{:?}", key).as_str(),
+            db.statement = ?key,
             db.system = "rocksdb",
-            http.status_code = "200",
-        );
-        let _ = span.enter();
+        )
+        .enter();
 
-        Ok(self.get_raw(key).map_err(span_err)?.is_some())
+        Ok(self.get_raw(key)?.is_some())
     }
 
     pub fn delete(&self, key: &K) -> Result<()> {
-        let span = trace_span!(
-            "Db::delete",
+        let _ = trace_span!(
+            "delete",
             db.name = self.db_name.as_str(),
-            db.statement = format!("{:?}", key).as_str(),
+            db.statement = ?key,
             db.system = "rocksdb",
-            http.status_code = "200",
-        );
-        let _ = span.enter();
+        )
+        .enter();
 
-        let key = self.bin_opts.serialize(&key.to_db()).map_err(span_err)?;
-        self.db.delete(&key).map_err(span_err)?;
-        Ok(())
+        let key = serialize_to_bytes(key, &self.db_name)?;
+
+        self.db
+            .delete(&key)
+            .map_err(|e| map_log_err(e, &self.db_name))
     }
 
-    pub fn get(&self, key: &K) -> Result<Option<V>> {
-        let span = trace_span!(
-            "Db::get",
+    /// Gets a value from the database.
+    pub fn get(&self, key: &K) -> Result<Option<DbValue>> {
+        let _ = trace_span!(
+            "get",
             db.name = self.db_name.as_str(),
-            db.statement = format!("{:?}", key).as_str(),
+            db.statement = ?key,
             db.system = "rocksdb",
-            http.status_code = "200",
-        );
-        let _ = span.enter();
+        )
+        .enter();
 
-        Ok(match self.get_raw(key)? {
-            Some(bytes) => Some(V::from_db(
-                self.bin_opts.deserialize(&bytes).map_err(span_err)?,
-            )),
-            None => None,
-        })
-    }
-
-    fn get_raw(&self, key: &K) -> Result<Option<Vec<u8>>> {
-        let key = self.bin_opts.serialize(&key.to_db()).map_err(span_err)?;
-
-        let value = match self.db.get(&key).map_err(span_err)? {
-            Some(value) => value,
-            None => return Ok(None),
-        };
-
-        Ok(Some(match self.encrypt {
-            Some(cipher) => {
-                let mut fallback = [0u8; 12];
-                let nonce = prepare_nonce(&key, &mut fallback);
-                cipher.decrypt(nonce, &value[..]).map_err(span_err)?
-            }
-            None => value,
+        Ok(self.get_raw(key)?.map(|bytes| DbValue {
+            bytes,
+            db_name: &self.db_name,
         }))
     }
 
-    pub fn iter(&self, mode: IteratorMode<K>) -> Result<Iter<K, V>> {
+    fn get_raw<'a>(&'a self, key: &K) -> Result<Option<DBPinnableSlice<'a>>> {
+        let key = serialize_to_bytes(key, &self.db_name)?;
+
+        match self.db.get_pinned(&key) {
+            Ok(Some(value)) => Ok(Some(value)),
+            Ok(None) => Ok(None),
+            Err(e) => Err(map_log_err(e, &self.db_name)),
+        }
+    }
+
+    pub fn iter(&self, mode: IteratorMode<K>) -> Result<Iter<K>> {
         let span = Arc::new(trace_span!(
-            "Db::iter",
+            "iter",
             db.name = self.db_name.as_str(),
             db.statement = format!("mode = {:?}", mode).as_str(),
             db.system = "rocksdb",
-            http.status_code = "200",
         ));
         let _ = span.enter();
 
-        let bin_opts = &self.bin_opts;
         let mut iter = self.db.raw_iterator();
 
         let dir = match mode {
-            IteratorMode::From(v, dir) => {
-                let key = bin_opts.serialize(&v.to_db()).map_err(span_err)?;
+            IteratorMode::From(k, dir) => {
+                let key = serialize_to_bytes(&k, &self.db_name)?;
 
                 match dir {
                     Direction::Forward => iter.seek(&key),
@@ -169,145 +128,94 @@ where
 
         Ok(Iter {
             _k: PhantomData,
-            _v: PhantomData,
-            bin_opts,
             dir,
             db_name: &self.db_name,
-            encrypt: self.encrypt,
             iter,
             must_call_next: false,
         })
     }
 
-    pub fn put(&self, key: &K, value: &V) -> Result<()> {
-        let span = trace_span!(
-            "Db::put",
+    pub fn put<V>(&self, key: &K, value: &V) -> Result<()>
+    where
+        V: Serialize,
+    {
+        let _ = trace_span!(
+            "put",
             db.name = self.db_name.as_str(),
             db.statement = format!("{:?}", key).as_str(),
             db.system = "rocksdb",
-            http.status_code = "200",
-        );
-        let _ = span.enter();
+        )
+        .enter();
 
-        // serializing keys in big endian to preserve sorting order when iterating the db.
-        let key = self.bin_opts.serialize(&key.to_db()).map_err(span_err)?;
-        let val = self.bin_opts.serialize(&value.to_db()).map_err(span_err)?;
+        let key = serialize_to_bytes(key, &self.db_name)?;
+        let val = serialize_to_bytes(value, &self.db_name)?;
 
-        match &self.encrypt {
-            Some(cypher) => {
-                let mut fallback = [0u8; 12];
-                let nonce = prepare_nonce(&key, &mut fallback);
-                let encrypted = cypher.encrypt(nonce, &val[..]).map_err(span_err)?;
-
-                Ok(self.db.put(&key, encrypted).map_err(span_err)?)
-            }
-            None => Ok(self.db.put(&key, &val).map_err(span_err)?),
-        }
+        self.db
+            .put(&key, &val)
+            .map_err(|e| map_log_err(e, &self.db_name))
     }
 }
 
-type BinOpts = WithOtherEndian<bincode::DefaultOptions, BigEndian>;
-
-fn bin_opts() -> BinOpts {
-    bincode::options().with_big_endian()
+pub struct DbValue<'a> {
+    bytes: DBPinnableSlice<'a>,
+    db_name: &'a str,
 }
 
-#[derive(Clone, Copy)]
-pub struct DbKeyValue<'a, K, V> {
+impl<'a> DbValue<'a> {
+    pub fn to_inner<'b, V>(&'b self) -> Result<V>
+    where
+        V: Deserialize<'b>,
+    {
+        deserialize_from_bytes(&self.bytes, self.db_name)
+    }
+}
+
+pub struct DbKeyValue<'a, K> {
     _k: PhantomData<K>,
-    _v: PhantomData<V>,
-    bin_opts: &'a BinOpts,
     db_name: &'a str,
-    encrypt: Option<&'a Aes256Gcm>,
     iter: &'a DBRawIterator<'a>,
 }
 
-impl<'a, K, V> DbKeyValue<'a, K, V>
-where
-    K: for<'b> AdaptToDb<'b>,
-{
-    pub fn get_key(&self) -> Result<K> {
-        Ok(K::from_db(
-            self.bin_opts.deserialize(
-                self.iter
-                    .key()
-                    .ok_or_else(|| Error::NoKey)
-                    .map_err(|e| log_err(self.db_name, "get_key", e))?,
-            )?,
-        ))
+impl<'a, K> DbKeyValue<'a, K> {
+    pub fn key(&self) -> Result<K>
+    where
+        K: for<'de> Deserialize<'de>,
+    {
+        deserialize_from_bytes(self.key_as_bytes()?, self.db_name)
     }
 
-    pub fn into_db_value(self) -> DbValue<'a, V> {
-        DbValue {
-            _v: PhantomData,
-            bin_opts: self.bin_opts,
-            db_name: self.db_name,
-            encrypt: self.encrypt,
-            iter: self.iter,
-        }
+    fn key_as_bytes(&self) -> Result<&[u8]> {
+        self.iter
+            .key()
+            .ok_or_else(|| log_err(Error::NoKey, self.db_name))
     }
 
-    pub fn into_key_and_db_value(self) -> Result<(K, DbValue<'a, V>)> {
-        Ok((
-            self.get_key()
-                .map_err(|e| log_err(self.db_name, "into_key_and_db_value", e))?,
-            DbValue {
-                _v: PhantomData,
-                bin_opts: self.bin_opts,
-                db_name: self.db_name,
-                encrypt: self.encrypt,
-                iter: self.iter,
-            },
-        ))
+    pub fn value<'de, V>(&'de self) -> Result<V>
+    where
+        V: Deserialize<'de>,
+    {
+        deserialize_from_bytes(self.value_as_bytes()?, self.db_name)
     }
-}
 
-pub struct DbValue<'a, V> {
-    _v: PhantomData<V>,
-    bin_opts: &'a BinOpts,
-    db_name: &'a str,
-    encrypt: Option<&'a Aes256Gcm>,
-    iter: &'a DBRawIterator<'a>,
-}
-
-impl<'a, V> DbValue<'a, V>
-where
-    V: AdaptToDb<'a>,
-{
-    pub fn into_value(self) -> Result<V> {
-        let value = self
-            .iter
+    fn value_as_bytes(&self) -> Result<&[u8]> {
+        self.iter
             .value()
-            .ok_or_else(|| Error::NoValue)
-            .map_err(|e| log_err(self.db_name, "into_value", e))?;
+            .ok_or_else(|| log_err(Error::NoValue, self.db_name))
+    }
+}
 
-        let decrypted;
+#[derive(Debug, Deserialize, PartialEq, PartialOrd, Serialize)]
+pub enum Direction {
+    Forward,
+    Reverse,
+}
 
-        let value = match self.encrypt {
-            None => value,
-            Some(cipher) => {
-                let key = self
-                    .iter
-                    .key()
-                    .ok_or_else(|| Error::NoKey)
-                    .map_err(|e| log_err(self.db_name, "into_value", e))?;
-
-                let mut fallback = [0u8; 12];
-                let nonce = prepare_nonce(&key, &mut fallback);
-
-                decrypted = cipher
-                    .decrypt(nonce, &value[..])
-                    .map_err(|e| log_err(self.db_name, "into_value", e))?;
-
-                &decrypted
-            }
-        };
-
-        Ok(V::from_db(
-            self.bin_opts
-                .deserialize(value)
-                .map_err(|e| log_err(self.db_name, "into_value", e))?,
-        ))
+impl From<Direction> for rocksdb::Direction {
+    fn from(d: Direction) -> Self {
+        match d {
+            Direction::Forward => Self::Forward,
+            Direction::Reverse => Self::Reverse,
+        }
     }
 }
 
@@ -339,76 +247,56 @@ where
     }
 }
 
-pub struct Iter<'a, K, V> {
+pub struct Iter<'a, K> {
     _k: PhantomData<K>,
-    _v: PhantomData<V>,
-    bin_opts: &'a BinOpts,
     db_name: &'a str,
     dir: Direction,
-    encrypt: Option<&'a Aes256Gcm>,
     iter: DBRawIterator<'a>,
     must_call_next: bool,
 }
 
-impl<'a, K, V> Iter<'a, K, V> {
-    pub fn current(&self) -> DbKeyValue<K, V> {
-        DbKeyValue {
-            _k: PhantomData,
-            _v: PhantomData,
-            bin_opts: self.bin_opts,
-            db_name: self.db_name,
-            encrypt: self.encrypt,
-            iter: &self.iter,
-        }
-    }
-
-    pub fn next(&mut self) -> Result<Option<DbKeyValue<K, V>>> {
+impl<'a, K> Iter<'a, K> {
+    #[allow(clippy::should_implement_trait)]
+    pub fn next(&mut self) -> Result<Option<DbKeyValue<K>>> {
         if self.must_call_next {
             match self.dir {
                 Direction::Forward => self.iter.next(),
                 Direction::Reverse => self.iter.prev(),
             }
 
-            self.iter
-                .status()
-                .map_err(|e| log_err(self.db_name, "next", e))?;
+            self.iter.status().map_err(|e| log_err(e, self.db_name))?;
         }
 
         self.must_call_next = true;
 
         Ok(if self.iter.valid() {
-            Some(self.current())
+            Some(DbKeyValue {
+                _k: PhantomData,
+                db_name: self.db_name,
+                iter: &self.iter,
+            })
         } else {
             None
         })
     }
 }
 
-fn log_err<E: Display>(db_name: &str, db_operation: &str, e: E) -> E {
-    error!({ db.name = db_name, db.operation = db_operation, db.system = "rocksdb" }, "{}", e);
+fn deserialize_from_bytes<'a, T: Deserialize<'a>>(bytes: &'a [u8], db_name: &str) -> Result<T> {
+    crate::deserialize_from_bytes(bytes).map_err(|e| log_err(e, db_name))
+}
+
+fn log_err<E: Display>(e: E, db_name: &str) -> E {
+    error!({ db.name = db_name, db.system = "rocksdb" }, "{}", e);
     e
 }
 
-fn prepare_nonce<'a>(
-    key: &'a [u8],
-    fallback: &'a mut [u8; 12],
-) -> &'a GenericArray<u8, aes_gcm::aead::consts::U12> {
-    // aes needs nonce of 12 bytes.
-    if key.len() >= 12 {
-        // if the key is longer than the required len, we just take the required data from the key.
-        // This is a zero copy (fastest)
-        GenericArray::from_slice(&key[0..12])
-    } else {
-        // if the key is shorter than the required len, we pad with 0
-        // This requires copy but since we are using a fallback, we do not need allocation (faster).
-        *fallback = [0u8; 12];
-        fallback.copy_from_slice(&key);
-        GenericArray::from_slice(&*fallback)
+fn map_log_err(e: rocksdb::Error, db_name: &str) -> Error {
+    Error::RocksDb(log_err(e, db_name))
+}
+
+fn serialize_to_bytes<T: Serialize>(value: &T, db_name: &str) -> Result<Vec<u8>> {
+    match crate::serialize_to_bytes(value) {
+        Ok(o) => Ok(o),
+        Err(e) => Err(log_err(e, db_name)),
     }
-}
-
-fn span_err<E: Display>(e: E) -> E {
-    Span::current().record("http.status_code", &"500");
-    error!("{}", e);
-    e
 }

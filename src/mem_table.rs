@@ -1,5 +1,6 @@
-use super::{AdaptToDb, Db, IteratorMode, Result};
+use super::{Db, IteratorMode, Result};
 use crate::UpdateFrom;
+use serde::{Deserialize, Serialize};
 use std::{
     borrow::Borrow,
     collections::hash_map::{HashMap, Iter, RandomState},
@@ -8,38 +9,35 @@ use std::{
 };
 
 /// A fully in-memory loaded table.
-pub struct MemTable<'a, K, V, S = RandomState> {
-    db: Db<'a, K, V>,
+pub struct MemTable<K, V, S = RandomState> {
+    db: Db<K>,
     map: HashMap<K, V, S>,
 }
 
-impl<'a, K, V> MemTable<'a, K, V, RandomState>
+impl<K, V> MemTable<K, V, RandomState>
 where
-    K: for<'b> AdaptToDb<'b> + Debug + Eq + Hash,
-    V: for<'b> AdaptToDb<'b>,
+    K: for<'de> Deserialize<'de> + Debug + Eq + Hash + Serialize,
+    V: for<'de> Deserialize<'de> + Serialize,
 {
-    pub fn new(db: Db<'a, K, V>) -> Result<Self> {
+    pub fn new(db: Db<K>) -> Result<Self> {
         Self::with_hasher(db, Default::default())
     }
 }
 
-impl<'a, K, V, S> MemTable<'a, K, V, S>
+impl<K, V, S> MemTable<K, V, S>
 where
-    K: for<'b> AdaptToDb<'b> + Debug + Eq + Hash,
-    V: for<'b> AdaptToDb<'b>,
+    K: for<'de> Deserialize<'de> + Debug + Eq + Hash + Serialize,
+    V: for<'de> Deserialize<'de> + Serialize,
     S: BuildHasher,
 {
-    pub fn with_hasher(db: Db<'a, K, V>, hasher: S) -> Result<Self> {
+    pub fn with_hasher(db: Db<K>, hasher: S) -> Result<Self> {
         let mut map = HashMap::with_hasher(hasher);
 
         {
             let mut iter = db.iter(IteratorMode::Start)?;
 
             while let Some(kv) = iter.next()? {
-                let (key, db_value) = kv.into_key_and_db_value()?;
-                let value = db_value.into_value()?;
-
-                map.insert(key, value);
+                map.insert(kv.key()?, kv.value()?);
             }
         }
 
@@ -72,6 +70,28 @@ where
         Q: Eq + Hash,
     {
         self.map.get(key)
+    }
+
+    pub fn get_or_init<F>(&mut self, key: &K, f: F) -> Result<&V>
+    where
+        F: FnOnce() -> V,
+        K: Clone,
+    {
+        if !self.map.contains_key(&key) {
+            let v = f();
+            self.db.put(key, &v)?;
+            self.map.insert(key.clone(), v);
+        }
+
+        Ok(self.map.get(key).unwrap())
+    }
+
+    pub fn get_or_default(&mut self, key: &K) -> Result<&V>
+    where
+        K: Clone,
+        V: Default,
+    {
+        self.get_or_init(key, Default::default)
     }
 
     pub fn iter(&self) -> Iter<K, V> {
@@ -109,7 +129,7 @@ where
 
         if r.is_err() {
             if let Some(v) = self.db.get(&key)? {
-                self.map.insert(key, v);
+                self.map.insert(key, v.to_inner()?);
             }
         } else {
             self.map.insert(key, v);
